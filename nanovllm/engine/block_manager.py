@@ -1,3 +1,11 @@
+''' How it works:
+- BlockManager doesn't track sequences directly; it manages a pool of physical blocks.
+- Each Sequence has a block_table that maps logical blocks to physical block IDs.
+- Reference counting (ref_count) tracks how many sequences share a block.
+- Prefix caching: multiple sequences can share the same physical block if content matches.
+- Access pattern: block_manager.blocks[seq.block_table[i]] gets the physical block for logical block i.
+- The block_table is the link between sequences and their KV cache blocks. '''
+
 from collections import deque
 import xxhash # fast hash function for keys
 import numpy as np
@@ -138,10 +146,10 @@ class BlockManager:
         else:
             assert last_block.hash != -1, "Last block should have a hash"
 
-''' Example Trace (block_size = 256)
-len(seq) = 255: 255 % 256 = 255 → Case 3 (no action)
-len(seq) = 256: 256 % 256 = 0 → Case 2 (compute hash, cache block)
-len(seq) = 257: 257 % 256 = 1 → Case 1 (allocate new block)
-len(seq) = 258: 258 % 256 = 2 → Case 3 (no action)
-len(seq) = 512: 512 % 256 = 0 → Case 2 (compute hash, cache block)
-'''
+        ''' Example Trace (block_size = 256)
+        len(seq) = 255: 255 % 256 = 255 → Case 3 (no action)
+        len(seq) = 256: 256 % 256 = 0 → Case 2 (compute hash, cache block)
+        len(seq) = 257: 257 % 256 = 1 → Case 1 (allocate new block)
+        len(seq) = 258: 258 % 256 = 2 → Case 3 (no action)
+        len(seq) = 512: 512 % 256 = 0 → Case 2 (compute hash, cache block)
+        '''
