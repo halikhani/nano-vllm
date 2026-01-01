@@ -1,12 +1,13 @@
 ''' Two classes for tensor-parallel (TP) distributed training:
 VocabParallelEmbedding — vocabulary-parallel embedding layer
 ParallelLMHead — parallel language model head (extends the embedding class) '''
+from webbrowser import get
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from nanovllm.utils import context
+from nanovllm.utils import get_context
 
 class VocabParallelEmbedding(nn.Module):
     ''' Distributes the vocabulary embedding table across multiple GPUs/ranks in tensor-parallel training.
@@ -14,7 +15,7 @@ class VocabParallelEmbedding(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int):
         super().__init__()
         self.tp_rank = dist.get_rank()
-        self.tp_dize = dist.get_world_size()
+        self.tp_size = dist.get_world_size()
         # Each rank holds num_embeddings // tp_size embeddings
         assert num_embeddings % self.tp_size == 0, "num_embeddings must be divisible by tp_size"
         self.num_embeddings = num_embeddings
@@ -48,6 +49,7 @@ class VocabParallelEmbedding(nn.Module):
             x = mask * (x - self.vocab_start_idx) # converts global indices to local indices
         # x: Contains local indices (and zeros for out-of-shard tokens).
         y = F.embedding(x, self.weight)
+        # This does: y[i] = self.weight[x[i]]
         if self.tp_size > 1:
             # mask.unsqueeze(1) * y: Element-wise multiplication to zero out embeddings for tokens not in this rank’s shard.
             y = mask.unsqueeze(1) * y 
@@ -61,4 +63,28 @@ class VocabParallelEmbedding(nn.Module):
     
 
 class ParallelLMHead(VocabParallelEmbedding):
-    pass
+    ''' Purpose: Converts hidden states → vocabulary logits
+
+    Input: Hidden states (vectors from transformer layers, shape [batch, embedding_dim])
+    Operation: Matrix multiplication
+    Formula: logits = hidden_states @ weight.T
+    Output: Logits (scores for each vocabulary token, shape [batch, vocab_size])'''
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, bias: bool = False):
+        assert not bias
+        super().__init__(num_embeddings, embedding_dim)
+    
+    def forward(self, x: torch.Tensor):
+        context = get_context()
+        if context.is_prefill:
+            last_indices = context.cu_seqlens_q[1:] - 1
+            x = x[last_indices].contiguous() # Extracts last token embeddings per sequence
+        logits = F.linear(x, self.weight)
+        if self.tp_size > 1:
+            # Rank 0 allocates a list of tensors to receive shards from all ranks
+            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
+            dist.all_gather(all_logits, logits, 0)
+            # After gather:
+            # Rank 0: all_logits = [logits_rank0, logits_rank1, logits_rank2, logits_rank3]
+            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+        return logits
